@@ -2,6 +2,7 @@ import datetime
 import calendar
 import traceback
 import pygame as pg
+import logging
 
 # TODO: a.m. and p.m.
 
@@ -49,7 +50,7 @@ class Clock:
         self.hours = time.hour % self.hour_mode + self.minutes / 60
 
     def construct_image(self):
-        font = self.app.font
+        font = self.app.fonts['digital_mono']
         txt = self.time_string
         self.image, self.rect = font.render(txt,
                                             fgcolor=self.fgcolor,
@@ -75,6 +76,9 @@ class Clock:
         else:
             self.time_string = (f'{int(self.hours):02d}:'
                                 f'{int(self.minutes):02d}')
+        # hide the colon every two seconds 
+        if int(self.seconds) % 2 == 0:
+            self.time_string = self.time_string.replace(':',' ')
 
         self.construct_image()
 
@@ -100,4 +104,4 @@ class Clock:
             setattr(self.rect, align, pos)
             screen.blit(self.image, self.rect)
         except pg.error:
-            traceback.print_exc()
+            logging.error(traceback.format_exc())
