@@ -1,0 +1,21 @@
+{
+"window_width": 800,
+"window_height": 480,
+"background_color": "#075869",
+"FPS": 10,
+"FPS_plot_mode": 60,
+"clock_size": 96,
+"api_interval_weather": 300,
+"api_interval_forecast": 600,
+"city": "Osnabrueck,DE",
+"indoor_read_interval": 30,
+"repeated_readings": 3,
+"reading_aggregation": "median",
+"device_pin": 4,
+"plot_ytick_intervals": {
+    "outdoor_temperature": 2,
+    "outdoor_humidity": 10
+    },
+"debug_mode": 1,
+"log_mouse_position": 0
+}

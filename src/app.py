@@ -2,54 +2,34 @@ import pygame as pg
 import pygame.freetype
 import os
 import json
-import csv
-import datetime
+import inspect
+from itertools import cycle
+import logging
+import threading
+from collections import deque
 
 import clock
+import states
 from weather_api import get_weather_data, get_forecast_data
+from functions import load_weather_codes
+import raspiboard
 
 pygame_error = pg.error
 pygame_quit = pg.quit
 
-
-def celsius(kelvin):
-    return kelvin - 273.15
-
-
-def replace_umlauts(string):
-    umlauts = {
-        'ä': 'ae',
-        'ö': 'oe',
-        'ü': 'ue',
-        'ß': 'ss'
-    }
-    for key, value in umlauts.items():
-        string = string.replace(key, value)
-    return string
-
-
-def load_weather_codes(filename):
-    codes = {}
-    with open(filename) as csv_file:
-        csv_reader = csv.DictReader(csv_file, delimiter=',')
-        for i, row in enumerate(csv_reader):
-            codes[row['ID']] = row
-    return codes
 
 
 class App:
     def __init__(self, **settings):
         pg.init()
         self.settings = settings
-        self.screen = pg.display.set_mode((
-            settings['window_width'],
-            settings['window_height']
-        )
-        )
+        self.screen = pg.display.set_mode((settings['window_width'],
+                                           settings['window_height']))
         self.screen_rect = self.screen.get_rect()
         self.clock = pg.time.Clock()
         self.fps = settings['FPS']
         self.running = True
+        self.should_stop = threading.Event()
         self.window_flags = 0
         self.mouse_visible = True
 
@@ -59,9 +39,16 @@ class App:
         # load all assets
         self.base_dir = os.path.join(os.path.dirname(__file__), '..')
         assets_folder = os.path.join(self.base_dir, 'assets')
+        data_folder = os.path.join(self.base_dir, 'data')
         # load font(s)
-        font_file = os.path.join(assets_folder, 'digital-7.ttf')
-        self.font = pygame.freetype.Font(font_file, size=36)
+        font_file1 = os.path.join(assets_folder, 'digital-7 (mono).ttf')
+        font_file2 = os.path.join(assets_folder, 'digital-7.ttf')
+        self.fonts = {
+            'digital_mono': pygame.freetype.Font(font_file1),
+            'digital': pygame.freetype.Font(font_file2),
+            'arial': pygame.freetype.SysFont('arial', size=32)
+            }
+        
         # load images
         sprite_files = list(
             filter(lambda x: x[-3:] == 'png', os.listdir(assets_folder)))
@@ -69,34 +56,49 @@ class App:
             os.path.join(assets_folder, f)).convert_alpha()
                          for f in sprite_files}
         # construct the background image
-        self.background_image = sprite_images['background_mockup']
+        self.background_image = sprite_images['background']
         self.image = pg.Surface(self.background_image.get_size())
         self.image.fill(pg.Color(settings['background_color']))
         self.image.blit(self.background_image, (0, 0))
+        # copy the image for redrawing
+        self.image_original = self.image.copy()
+        # list of rects where to update the screen
+        self.update_rects = []
 
-        with open(os.path.join(assets_folder, 'api_key.txt'), 'r') as f:
+        with open(os.path.join(data_folder, 'api_key.txt'), 'r') as f:
             self.weather_api_key = f.read()
 
         self.city = settings['city']
-        self.outdoor_data = get_weather_data(self.weather_api_key,
-                                             self.city)
-        self.forecast_data = get_forecast_data(self.weather_api_key,
-                                               self.city)
-        # set api call interval in seconds
-        self.daytime_clock.add_timer('weather_outdoor',
-                                     settings['api_interval_weather'],
-                                     self.process_outdoor_weather)
-        self.daytime_clock.add_timer('weather_forecast',
-                                     settings['api_interval_forecast'],
-                                     self.process_weather_forecast)
-        self.history = {
-            'outdoor_timestamp': [],
-            'outdoor_temperature': [],
-            'outdoor_humidity': [],
-            'outdoor_weather': []
-        }
-        self.weather_codes = load_weather_codes(os.path.join(assets_folder,
+        self.outdoor_data_heap = deque()
+        self.forecast_data_heap = deque()
+        self.indoor_data_heap = deque()
+
+        if raspiboard.RPI:
+            # if module runs on Pi
+            self.logger = raspiboard.Logger(self,
+                                            settings['indoor_read_interval'])
+        else:
+            # TODO: print "no logger connected" to screen
+            pass
+
+        # check if history.json exists and load it
+        self.history_file = os.path.join(data_folder, 'history.json')
+        if os.path.isfile(self.history_file):
+            with open(self.history_file, 'r') as f:
+                self.history = json.load(f)
+        else:
+            self.history = {
+                'outdoor_timestamp': [],
+                'outdoor_temperature': [],
+                'outdoor_humidity': [],
+                'outdoor_weather': [],
+                'indoor_timestamp': [],
+                'indoor_temperature': [],
+                'indoor_humidity': []
+            }
+        self.weather_codes = load_weather_codes(os.path.join(data_folder,
                                                 'condition_codes.csv'))
+
         # load the corresponding images
         # get unique weather codes
         weather_image_names = []
@@ -113,12 +115,34 @@ class App:
                                                filename)).convert_alpha()
             self.weather_code_surfaces[filename] = image
 
+        # setup the State Machine
+        self.state_dict = {}
+        self.state_name = 'Main'  # state at the start
+        self.state = None
+        self.setup_states()
+        self.state.redraw()
+        
+        # what plot to show in the Plots state
+        self.show_plot = 'outdoor_temperature'
+
         # call API once in the beginning
-        self.process_weather_forecast()
-        self.process_outdoor_weather()
+        t1 = threading.Thread(target=self.process_weather_beginning())
+        t1.start()
+
+        # mirror the event queue
+        self.event_queue = []
+
+        # for debugging
+        self.debug = bool(settings['debug_mode'])
+        if self.debug:
+            self.states_cycle = cycle(self.state_dict.keys())
+            next(self.states_cycle)
+
 
     def events(self):
+        self.event_queue = []
         for event in pg.event.get():
+            self.event_queue.append(event)
             if event.type == pg.QUIT:
                 self.running = False
             elif event.type == pg.KEYDOWN:
@@ -136,129 +160,58 @@ class App:
                     self.mouse_visible = True
                     pg.mouse.set_visible(True)
                     self.reset_app_screen()
+                elif event.key == pg.K_s:
+                    if self.debug:
+                        # TODO: for debugging
+                        # cycle the states
+                        self.state.next = next(self.states_cycle)
+                        self.state.done = True
+            elif event.type == pg.MOUSEBUTTONDOWN:
+                if self.settings['log_mouse_position']:
+                    mpos = pg.mouse.get_pos()
+                    logging.info(f'mouse {int(mpos[0])},{int(mpos[1])}')
+
 
     def update(self, dt):
-        # get system time
-        self.daytime_clock.update(dt, show_seconds=False)
+        if self.state.done:
+            self.flip_state()
+        self.state.update(dt)
 
-        for event, callback in self.daytime_clock.clear_timer_events().items():
-            print(f'called {event} at {datetime.datetime.now()}')
-            if callback:
-                callback()
+        pg.display.set_caption(f'{round(self.clock.get_fps(), 1)}')
+
 
     def draw(self):
-        self.screen.blit(self.image, self.screen_rect)
-        # draw the time and date
-        self.daytime_clock.draw(self.screen,
-                                (self.screen_rect.centerx,
-                                 self.screen_rect.h - 120),
-                                'center')
-        day = clock.get_weekday()
-        date_string = f'{day[0][:3]}  {day[1]:02d}.{day[2]:02d}.{day[3]}'
-        date_txt, date_rect = self.font.render(date_string,
-                                               fgcolor=pg.Color('white'),
-                                               size=36
-                                               )
-        date_rect.center = (self.screen_rect.centerx,
-                            self.screen_rect.h - 50)
-        self.screen.blit(date_txt, date_rect)
-
-        # draw the temperatures and humidity
-        # TODO: render once, not every frame!
-        # TODO: put this in a dict with text, position and render in a loop!
-        # TODO: Add temperature to forecast
-        txt, rect = self.font.render('OUTDOOR',
-                                     fgcolor=pg.Color('white'),
-                                     size=48)
-        rect.center = (136, 48)
-        self.screen.blit(txt, rect)
-
-        txt, rect = self.font.render('INDOOR',
-                                     fgcolor=pg.Color('white'),
-                                     size=48)
-        rect.center = (self.screen_rect.w - 136, 48)
-        self.screen.blit(txt, rect)
-        # temperature value
-        temp = f'{celsius(self.outdoor_data["main"]["temp"]):.1f} C'
-        txt, rect = self.font.render(temp,
-                                     fgcolor=pg.Color('white'),
-                                     size=110)
-        rect.center = (140, 130)
-        self.screen.blit(txt, rect)
-
-        temp = '18.0 C'
-        txt, rect = self.font.render(temp,
-                                     fgcolor=pg.Color('white'),
-                                     size=110)
-        rect.center = (self.screen_rect.w - 130, 130)
-        self.screen.blit(txt, rect)
-
-        txt, rect = self.font.render('temperature',
-                                     fgcolor=pg.Color('white'),
-                                     size=32)
-        rect.center = (136, 196)
-        self.screen.blit(txt, rect)
-        rect.center = (self.screen_rect.w - 136, 196)
-        self.screen.blit(txt, rect)
-
-        # draw the humidity
-        humidity = self.outdoor_data.get('main').get('humidity')
-        hum_string = f'{humidity} %'
-        txt, rect = self.font.render(hum_string,
-                                     fgcolor=pg.Color('white'),
-                                     size=110)
-        rect.center = (140, 300)
-        self.screen.blit(txt, rect)
-
-        #humidity = self.outdoor_data.get('main').get('humidity')
-        hum_string = '50 %'
-        txt, rect = self.font.render(hum_string,
-                                     fgcolor=pg.Color('white'),
-                                     size=110)
-        rect.center = (self.screen_rect.w - 130, 300)
-        self.screen.blit(txt, rect)
-
-        txt, rect = self.font.render('humidity',
-                                     fgcolor=pg.Color('white'),
-                                     size=32)
-        rect.center = (136, 366)
-        self.screen.blit(txt, rect)
-        rect.center = (self.screen_rect.w - 136, 366)
-        self.screen.blit(txt, rect)
-
-        # draw the weather conditions
-        city_name = replace_umlauts(self.outdoor_data['name'])
-        txt, rect = self.font.render(city_name,
-                                     fgcolor=pg.Color('white'),
-                                     size=36)
-        rect.center = (self.screen_rect.centerx, self.screen_rect.h * 0.55)
-        self.screen.blit(txt, rect)
-        code = self.history['outdoor_weather'][-1]['icon'] + '.png'
-        image = self.weather_code_surfaces.get(code, None)
-        if image:
-            image = pg.transform.scale(image, (128, 128))
-            rect = image.get_rect()
-            rect.center = (self.screen_rect.centerx,
-                           self.screen_rect.h * 0.2)
-            self.screen.blit(image, rect)
-        # draw the 3 hourly forecast
-        for i, item in enumerate(self.forecast_data['list'][:6]):
-            code = item['weather'][0]['icon'] + '.png'
-            image = self.weather_code_surfaces.get(code, None)
-            if image:
-                rect = image.get_rect()
-                x_coord = (self.screen_rect.centerx - 100) + 42 * i
-                rect.center = (x_coord, self.screen_rect.h * 0.4)
-                self.screen.blit(image, rect)
-            timestamp = datetime.datetime.utcfromtimestamp(item['dt'])
-            time = timestamp.strftime('%H:%M')
-            txt, rect = self.font.render(time, fgcolor=pg.Color('white'),
-                                         size=16)
-            rect.center = (x_coord, self.screen_rect.h * 0.4 + 32)
-            self.screen.blit(txt, rect)
+        self.state.draw(self.screen)
 
 
-        pg.display.update()
+    def setup_states(self):
+        # get a dictionary with all classes from the 'states' module
+        self.state_dict = dict(inspect.getmembers(states, inspect.isclass))
+        for key, state in self.state_dict.items():
+            self.state_dict[key] = state(self)
+        # remove the parent state class
+        del self.state_dict['State']
+        # define the state at the start of the program
+        self.state = self.state_dict[self.state_name]
+        # set a states name for __repr__
+        for name, state in self.state_dict.items():
+            state.name = name
+        self.state.startup()
+
+
+    def flip_state(self):
+        '''set the state to the next if the current state is done'''
+        self.state.done = False
+        # set the current and next state to the previous and current state
+        previous, self.state_name = self.state_name, self.state.next
+        self.state.cleanup()
+        if self.state_name is None:
+            self.running = False
+        else:
+            self.state = self.state_dict[self.state_name]
+            self.state.startup()
+            self.state.previous = previous
+
 
     def reset_app_screen(self):
         self.screen = pg.display.set_mode((
@@ -266,44 +219,60 @@ class App:
             self.settings['window_height']
         ), self.window_flags)
         self.screen_rect = self.screen.get_rect()
-        pg.display.update()
+        self.state.redraw()
+
+
+    def process_weather_beginning(self):
+        # get the current weather
+        outdoor_data = get_weather_data(self.weather_api_key,
+                                        self.city)
+        self.outdoor_data_heap.append(outdoor_data)
+        # get the 3 hourly weather forecast
+        forecast_data = get_forecast_data(self.weather_api_key,
+                                          self.city)
+        self.forecast_data_heap.append(forecast_data)
+        # update the screen after receiving information
+        self.state.redraw()
+        
 
     def process_outdoor_weather(self):
-        # get the current weather
-        self.outdoor_data = get_weather_data(self.weather_api_key,
-                                             self.city)
-        time = clock.get_timestamp()
-        temp = celsius(self.outdoor_data['main']['temp'])
-        humidity = self.outdoor_data['main']['humidity']
-        weather = self.outdoor_data['weather'][0]
-        self.history['outdoor_timestamp'].append(time)
-        self.history['outdoor_temperature'].append(temp)
-        self.history['outdoor_humidity'].append(humidity)
-        self.history['outdoor_weather'].append(weather)
+        while not self.should_stop.wait(self.settings['api_interval_weather']):
+            # get the current weather
+            outdoor_data = get_weather_data(self.weather_api_key,
+                                            self.city)
+            self.outdoor_data_heap.append(outdoor_data)
+
 
     def process_weather_forecast(self):
-        # get the 3 hourly weather forecast
-        self.forecast_data = get_forecast_data(self.weather_api_key,
-                                               self.city)
-        print(datetime.datetime.now())
-        print('Forecast for the next 24 hours:')
-        for item in self.forecast_data['list'][:8]:
-            timestamp = datetime.datetime.utcfromtimestamp(item['dt'])
-            condition = item['weather'][0]['description']
-            rain = item.get('rain', None)
-            string = (f'{timestamp.strftime("%a %d.%m.%y %H:%M")} '
-                      f'{condition.capitalize()}')
-            if rain:
-                string += f', {rain["3h"]} mm'
-            print(string)
+        while not self.should_stop.wait(
+                self.settings['api_interval_forecast']):
+            # get the 3 hourly weather forecast
+            forecast_data = get_forecast_data(self.weather_api_key,
+                                              self.city)
+            self.forecast_data_heap.append(forecast_data)
+    
+    
+    def start_threads(self):
+        t1 = threading.Thread(target=self.process_outdoor_weather)
+        t1.start()
+        t2 = threading.Thread(target=self.process_weather_forecast)
+        t2.start()
+        if raspiboard.RPI:
+            t3 = threading.Thread(target=self.logger.mainloop)
+            t3.start()
+
 
     def quit(self):
         # TODO: save settings etc
-        with open(os.path.join(self.base_dir, 'history.json'), 'w') as f:
+        with open(self.history_file, 'w') as f:
             json.dump(self.history, f)
+        # stop parallel threads
+        self.should_stop.set()
         pg.quit()
 
+
     def run(self):
+        self.start_threads()
         while self.running:
             dt = self.clock.tick(self.fps) / 1000
             self.events()
