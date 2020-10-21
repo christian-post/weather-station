@@ -1,2 +1,2 @@
 # weather-station
-weather station intended for raspberry pi (still in development)
+weather station intended for the Raspberry Pi (still in development)
